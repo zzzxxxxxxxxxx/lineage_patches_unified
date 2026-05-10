@@ -43,7 +43,7 @@ diff --git a/stack/btm/btm_acl.cc b/stack/btm/btm_acl.cc
 index 2c7bebd63..a20e6de34 100644
 --- a/stack/btm/btm_acl.cc
 +++ b/stack/btm/btm_acl.cc
-@@ -1209,17 +1209,17 @@ void btm_read_remote_ext_features_failed(uint8_t status, uint16_t handle) {
+@@ -1209,30 +1209,30 @@ void btm_read_remote_ext_features_failed(uint8_t status, uint16_t handle) {
  void btm_establish_continue(tACL_CONN* p_acl_cb) {
    tBTM_BL_EVENT_DATA evt_data;
    BTM_TRACE_DEBUG("btm_establish_continue");
@@ -56,6 +56,7 @@ index 2c7bebd63..a20e6de34 100644
 -
 -    if (btm_cb.btm_def_link_policy)
 -      BTM_SetLinkPolicy(p_acl_cb->remote_addr, &btm_cb.btm_def_link_policy);
+-  }
 +  if (!BTM_BYPASS_EXTRA_ACL_SETUP) {
 +    if (p_acl_cb->transport == BT_TRANSPORT_BR_EDR) {
 +      /* For now there are a some devices that do not like sending */
@@ -65,6 +66,16 @@ index 2c7bebd63..a20e6de34 100644
 +
 +      if (btm_cb.btm_def_link_policy)
 +        BTM_SetLinkPolicy(p_acl_cb->remote_addr, &btm_cb.btm_def_link_policy);
++    } else if (p_acl_cb->transport == BT_TRANSPORT_LE) {
++      tBTM_SEC_DEV_REC* p_dev_rec = btm_find_dev(p_acl_cb->remote_addr);
++      if (p_dev_rec == nullptr) {
++        LOG_WARN(LOG_TAG, "No security record for %s",
++                 PRIVATE_ADDRESS(p_acl_cb->remote_addr));
++      } else if (p_dev_rec->sec_flags & BTM_SEC_LE_LINK_KEY_KNOWN) {
++        btm_ble_set_encryption(
++            p_acl_cb->remote_addr, BTM_BLE_SEC_ENCRYPT,
++            p_dev_rec->role_master ? BTM_ROLE_MASTER : BTM_ROLE_SLAVE);
++      }
 +    }
    }
 -#endif
