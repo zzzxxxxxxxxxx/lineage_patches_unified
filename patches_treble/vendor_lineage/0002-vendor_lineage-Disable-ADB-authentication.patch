@@ -5,14 +5,14 @@ Subject: [PATCH 2/2] vendor_lineage: Disable ADB authentication
 
 Change-Id: I4370583ecab1c88ef6f42e29d3eaa52c24d13f09
 ---
- config/common.mk | 5 -----
- 1 file changed, 5 deletions(-)
+ config/common.mk | 10 ----------
+ 1 file changed, 10 deletions(-)
 
 diff --git a/config/common.mk b/config/common.mk
 index 55aab3f9..f85a7330 100644
 --- a/config/common.mk
 +++ b/config/common.mk
-@@ -13,16 +13,11 @@ PRODUCT_SYSTEM_DEFAULT_PROPERTIES += \
+@@ -15,18 +15,8 @@ PRODUCT_SYSTEM_DEFAULT_PROPERTIES += \
      ro.com.google.clientidbase=$(PRODUCT_GMS_CLIENTID_BASE)
  endif
  
@@ -20,8 +20,13 @@ index 55aab3f9..f85a7330 100644
  # Disable ADB authentication
  PRODUCT_SYSTEM_DEFAULT_PROPERTIES += ro.adb.secure=0
 -else
+-ifdef WITH_ADB_INSECURE
+-# Forcebly disable ADB authentication
+-PRODUCT_SYSTEM_DEFAULT_PROPERTIES += ro.adb.secure=0
+-else
 -# Enable ADB authentication
 -PRODUCT_SYSTEM_DEFAULT_PROPERTIES += ro.adb.secure=1
+-endif
  
  # Disable extra StrictMode features on all non-engineering builds
  PRODUCT_SYSTEM_DEFAULT_PROPERTIES += persist.sys.strictmode.disable=true
