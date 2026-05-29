@@ -1,0 +1,553 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: LineageOS Developer <developer@lineageos.org>
+Date: Fri, 29 May 2026 22:00:00 +0800
+Subject: [PATCH] Add Spreadtrum IMS compat bridge controller
+
+The Spreadtrum IMS APK (com.spreadtrum.ims) built for Android 9 uses
+an older version of android.telephony.ims.aidl.IImsServiceController
+that has incompatible method signatures and transaction codes compared
+to Android 12L.
+
+This adds:
+- SprdImsServiceControllerCompat: a bridge controller that translates
+  between the Android 12L framework calls and the old AIDL protocol
+  using raw Parcel transactions.
+- ImsResolver modifications to detect com.spreadtrum.ims and route it
+  through the SprdImsServiceControllerCompat.
+
+Change-Id: I0000000000000000000000000000000000000000
+---
+ .../ims/ImsResolver.java                      |  25 +
+ .../SprdImsServiceControllerCompat.java        | 460 ++++++++++++++++++
+ 2 files changed, 485 insertions(+)
+
+diff --git a/src/java/com/android/internal/telephony/ims/ImsResolver.java b/src/java/com/android/internal/telephony/ims/ImsResolver.java
+index 188e69582c..ebd5019656 100644
+--- a/src/java/com/android/internal/telephony/ims/ImsResolver.java
++++ b/src/java/com/android/internal/telephony/ims/ImsResolver.java
+@@ -414,6 +414,31 @@ public class ImsResolver implements ImsServiceController.ImsServiceControllerCal
+                 }
+             };
+ 
++    // Spreadtrum (com.spreadtrum.ims) uses an older version of the IImsServiceController AIDL
++    // that is incompatible with both the modern and compat paths. This factory creates a
++    // specialized controller that translates between the Android 12L and Android 9 protocols.
++    private final ImsServiceControllerFactory mImsServiceControllerFactorySprd =
++            new ImsServiceControllerFactory() {
++                @Override
++                public String getServiceInterface() {
++                    // The Spreadtrum APK uses the standard (non-compat) intent.
++                    return ImsService.SERVICE_INTERFACE;
++                }
++
++                @Override
++                public ImsServiceController create(Context context, ComponentName componentName,
++                        ImsServiceController.ImsServiceControllerCallbacks callbacks,
++                        ImsFeatureBinderRepository repo) {
++                    return new SprdImsServiceControllerCompat(context, componentName, callbacks,
++                            repo);
++                }
++            };
++
++    // Known packages that require the Spreadtrum compat path (use old Android 9 AIDL protocol)
++    private static final String[] SPRD_COMPAT_PACKAGES = {
++        "com.spreadtrum.ims"
++    };
++
+     private ImsDynamicQueryManagerFactory mDynamicQueryManagerFactory =
+             ImsServiceFeatureQueryManager::new;
+ 
+@@ -1686,9 +1711,27 @@ public class ImsResolver implements ImsServiceController.ImsServiceControllerCal
+         infos.addAll(searchForImsServices(packageName, mImsServiceControllerFactory));
+         // Search for compat ImsService Implementations
+         infos.addAll(searchForImsServices(packageName, mImsServiceControllerFactoryCompat));
++        // Replace factory for packages that need the Spreadtrum compat path
++        for (int i = 0; i < infos.size(); i++) {
++            ImsServiceInfo info = infos.get(i);
++            if (info.name != null && isSprdCompatPackage(info.name.getPackageName())) {
++                Log.i(TAG, "Replacing controller factory for SPRD compat package: "
++                        + info.name.getPackageName());
++                info.controllerFactory = mImsServiceControllerFactorySprd;
++            }
++        }
+         return infos;
+     }
+ 
++    private static boolean isSprdCompatPackage(String packageName) {
++        for (String pkg : SPRD_COMPAT_PACKAGES) {
++            if (pkg.equals(packageName)) {
++                return true;
++            }
++        }
++        return false;
++    }
++
+     private List<ImsServiceInfo> searchForImsServices(String packageName,
+             ImsServiceControllerFactory controllerFactory) {
+         List<ImsServiceInfo> infos = new ArrayList<>();
+diff --git a/src/java/com/android/internal/telephony/ims/SprdImsServiceControllerCompat.java b/src/java/com/android/internal/telephony/ims/SprdImsServiceControllerCompat.java
+new file mode 100644
+index 0000000000..9a172b168c
+--- /dev/null
++++ b/src/java/com/android/internal/telephony/ims/SprdImsServiceControllerCompat.java
+@@ -0,0 +1,460 @@
++/*
++ * Copyright (C) 2024 The LineageOS Project
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++package com.android.internal.telephony.ims;
++
++import android.content.ComponentName;
++import android.content.Context;
++import android.os.IBinder;
++import android.os.IInterface;
++import android.os.Parcel;
++import android.os.RemoteException;
++import android.telephony.ims.ImsService;
++import android.telephony.ims.aidl.IImsConfig;
++import android.telephony.ims.aidl.IImsMmTelFeature;
++import android.telephony.ims.aidl.IImsRcsFeature;
++import android.telephony.ims.aidl.IImsRegistration;
++import android.telephony.ims.aidl.IImsServiceController;
++import android.telephony.ims.aidl.ISipTransport;
++import android.telephony.ims.feature.ImsFeature;
++import android.util.Log;
++import android.util.SparseArray;
++
++import com.android.ims.ImsFeatureBinderRepository;
++import com.android.ims.internal.IImsFeatureStatusCallback;
++import com.android.ims.internal.IImsMMTelFeature;
++import com.android.ims.internal.IImsRcsFeature;
++
++/**
++ * ImsServiceController implementation for the Spreadtrum IMS APK
++ * (com.spreadtrum.ims) built for Android 9.
++ *
++ * The Spreadtrum IMS APK uses an older version of the
++ * android.telephony.ims.aidl.IImsServiceController AIDL that has different
++ * method signatures and transaction codes compared to Android 12L.
++ *
++ * Key differences from Android 12L IImsServiceController:
++ * - createMmTelFeature/createRcsFeature take an extra IImsFeatureStatusCallback param
++ * - No getImsServiceCapabilities() method
++ * - No addFeatureStatusCallback/removeFeatureStatusCallback (merged into create*Feature)
++ * - No getSipTransport() method
++ * - Transaction codes shifted due to missing/added methods
++ *
++ * This class provides a translation layer between the Android 12L framework
++ * (which uses the new AIDL) and the Spreadtrum APK (which uses the old AIDL).
++ */
++public class SprdImsServiceControllerCompat extends ImsServiceController {
++
++    private static final String TAG = "SprdImsSCCompat";
++    private static final String SPRD_PACKAGE = "com.spreadtrum.ims";
++
++    // Old AIDL descriptor used by the Spreadtrum APK's IImsServiceController
++    private static final String OLD_DESCRIPTOR =
++            "android.telephony.ims.aidl.IImsServiceController";
++
++    // Old transaction codes (Android 9 era IImsServiceController)
++    // These correspond to the method order in the old AIDL.
++    private static final int OLD_TRANSACTION_setListener = 1;
++    private static final int OLD_TRANSACTION_createMmTelFeature = 2;
++    private static final int OLD_TRANSACTION_createRcsFeature = 3;
++    private static final int OLD_TRANSACTION_querySupportedImsFeatures = 4;
++    private static final int OLD_TRANSACTION_notifyImsServiceReadyForFeatureCreation = 5;
++    private static final int OLD_TRANSACTION_removeImsFeature = 6;
++    private static final int OLD_TRANSACTION_getConfig = 7;
++    private static final int OLD_TRANSACTION_getRegistration = 8;
++    private static final int OLD_TRANSACTION_enableIms = 9;
++    private static final int OLD_TRANSACTION_disableIms = 10;
++
++    // Reference to the old-style IImsServiceController binder from the Spreadtrum APK
++    private IBinder mSprdServiceController;
++
++    // Feature status callbacks managed locally (old AIDL doesn't have add/remove callback methods)
++    private final java.util.Map<Integer, java.util.Map<Integer, IImsFeatureStatusCallback>>
++            mFeatureStatusCallbacks = new java.util.HashMap<>();
++
++    public SprdImsServiceControllerCompat(Context context, ComponentName componentName,
++            ImsServiceControllerCallbacks callbacks, ImsFeatureBinderRepository repo) {
++        super(context, componentName, callbacks, repo);
++        Log.i(TAG, "Created SprdImsServiceControllerCompat for " + componentName);
++    }
++
++    @Override
++    protected String getServiceInterface() {
++        // The Spreadtrum APK registers with the standard ImsService intent,
++        // not the compat one.
++        return ImsService.SERVICE_INTERFACE;
++    }
++
++    @Override
++    protected void setServiceController(IBinder serviceController) {
++        // We are only instantiated for com.spreadtrum.ims, so the binder
++        // uses the old Android 9 era AIDL protocol. The descriptor string
++        // is the SAME as the modern one ("android.telephony.ims.aidl.IImsServiceController"),
++        // so we must NOT call IImsServiceController.Stub.asInterface() — it would
++        // succeed but use wrong transaction codes.
++        if (serviceController == null) {
++            mSprdServiceController = null;
++            return;
++        }
++        Log.i(TAG, "Binding to Spreadtrum IMS service via old AIDL protocol");
++        mSprdServiceController = serviceController;
++    }
++
++    @Override
++    protected boolean isServiceControllerAvailable() {
++        return mSprdServiceController != null;
++    }
++
++    @Override
++    protected long getStaticServiceCapabilities() {
++        // Older implementations do not support optional static capabilities
++        return 0L;
++    }
++
++    @Override
++    protected void notifyImsServiceReady() {
++        if (mSprdServiceController == null) {
++            // No service bound yet, nothing to do
++            return;
++        }
++        try {
++            callOldNotifyImsServiceReady();
++        } catch (RemoteException e) {
++            Log.w(TAG, "notifyImsServiceReady error: " + e.getMessage());
++        }
++    }
++
++    // Reuse the compat adapters from ImsServiceControllerCompat
++    private final SparseArray<MmTelFeatureCompatAdapter> mMmTelCompatAdapters = new SparseArray<>();
++    private final SparseArray<ImsConfigCompatAdapter> mConfigCompatAdapters = new SparseArray<>();
++    private final SparseArray<ImsRegistrationCompatAdapter> mRegCompatAdapters =
++            new SparseArray<>();
++
++    @Override
++    protected IInterface createImsFeature(int slotId, int featureType)
++            throws RemoteException {
++        if (mSprdServiceController == null) {
++            return super.createImsFeature(slotId, featureType);
++        }
++
++        switch (featureType) {
++            case ImsFeature.FEATURE_MMTEL: {
++                return createMMTelCompat(slotId);
++            }
++            case ImsFeature.FEATURE_RCS: {
++                return createRcsCompat(slotId);
++            }
++            default:
++                return null;
++        }
++    }
++
++    private IImsMmTelFeature createMMTelCompat(int slotId) throws RemoteException {
++        IImsFeatureStatusCallback callback = getOrCreateFeatureStatusCallback(
++                slotId, ImsFeature.FEATURE_MMTEL);
++        IImsMMTelFeature oldFeature = callOldCreateMmTelFeature(slotId, callback);
++        if (oldFeature == null) {
++            Log.w(TAG, "createMMTelCompat: createMmTelFeature returned null");
++            return null;
++        }
++        MmTelInterfaceAdapter interfaceAdapter = new MmTelInterfaceAdapter(slotId,
++                oldFeature.asBinder());
++        MmTelFeatureCompatAdapter mmTelAdapter = new MmTelFeatureCompatAdapter(mContext, slotId,
++                interfaceAdapter);
++        mMmTelCompatAdapters.put(slotId, mmTelAdapter);
++        ImsRegistrationCompatAdapter regAdapter = new ImsRegistrationCompatAdapter();
++        mmTelAdapter.addRegistrationAdapter(regAdapter);
++        mRegCompatAdapters.put(slotId, regAdapter);
++        mConfigCompatAdapters.put(slotId, new ImsConfigCompatAdapter(
++                mmTelAdapter.getOldConfigInterface()));
++        return mmTelAdapter.getBinder();
++    }
++
++    private IImsRcsFeature createRcsCompat(int slotId) throws RemoteException {
++        IImsFeatureStatusCallback callback = getOrCreateFeatureStatusCallback(
++                slotId, ImsFeature.FEATURE_RCS);
++        IImsRcsFeature oldFeature = callOldCreateRcsFeature(slotId, callback);
++        if (oldFeature == null) {
++            Log.w(TAG, "createRcsCompat: createRcsFeature returned null");
++            return null;
++        }
++        // For now, return the old feature directly (RCS compat adapter can be added later)
++        // The old RcsFeature should implement com.android.ims.internal.IImsRcsFeature which
++        // is compatible enough for basic operation.
++        return null; // RCS not fully supported via SPRD compat yet
++    }
++
++    @Override
++    protected void registerImsFeatureStatusCallback(int slotId, int featureType,
++            IImsFeatureStatusCallback c) throws RemoteException {
++        if (mSprdServiceController == null) {
++            super.registerImsFeatureStatusCallback(slotId, featureType, c);
++            return;
++        }
++        // Old AIDL doesn't have separate addFeatureStatusCallback;
++        // store locally to pass on re-create.
++        storeFeatureStatusCallback(slotId, featureType, c);
++    }
++
++    @Override
++    protected void unregisterImsFeatureStatusCallback(int slotId, int featureType,
++            IImsFeatureStatusCallback c) {
++        if (mSprdServiceController == null) {
++            super.unregisterImsFeatureStatusCallback(slotId, featureType, c);
++            return;
++        }
++        removeFeatureStatusCallback(slotId, featureType);
++    }
++
++    @Override
++    protected void removeImsFeature(int slotId, int featureType) throws RemoteException {
++        if (mSprdServiceController == null) {
++            super.removeImsFeature(slotId, featureType);
++            return;
++        }
++        if (featureType == ImsFeature.FEATURE_MMTEL) {
++            mMmTelCompatAdapters.remove(slotId);
++            mRegCompatAdapters.remove(slotId);
++            mConfigCompatAdapters.remove(slotId);
++        }
++        IImsFeatureStatusCallback callback = getOrCreateFeatureStatusCallback(
++                slotId, featureType);
++        callOldRemoveImsFeature(slotId, featureType, callback);
++        removeFeatureStatusCallback(slotId, featureType);
++    }
++
++    @Override
++    public void enableIms(int slotId) {
++        if (mSprdServiceController == null) {
++            super.enableIms(slotId);
++            return;
++        }
++        MmTelFeatureCompatAdapter adapter = mMmTelCompatAdapters.get(slotId);
++        if (adapter == null) {
++            Log.w(TAG, "enableIms: adapter null for slot " + slotId);
++            return;
++        }
++        try {
++            adapter.enableIms();
++        } catch (RemoteException e) {
++            Log.w(TAG, "Couldn't enable IMS: " + e.getMessage());
++        }
++    }
++
++    @Override
++    public void disableIms(int slotId) {
++        if (mSprdServiceController == null) {
++            super.disableIms(slotId);
++            return;
++        }
++        MmTelFeatureCompatAdapter adapter = mMmTelCompatAdapters.get(slotId);
++        if (adapter == null) {
++            Log.w(TAG, "disableIms: adapter null for slot " + slotId);
++            return;
++        }
++        try {
++            adapter.disableIms();
++        } catch (RemoteException e) {
++            Log.w(TAG, "Couldn't disable IMS: " + e.getMessage());
++        }
++    }
++
++    @Override
++    public IImsConfig getConfig(int slotId) {
++        if (mSprdServiceController == null) {
++            return super.getConfig(slotId);
++        }
++        ImsConfigCompatAdapter adapter = mConfigCompatAdapters.get(slotId);
++        if (adapter == null) {
++            Log.w(TAG, "getConfig: Config does not exist for slot " + slotId);
++            return null;
++        }
++        return adapter.getIImsConfig();
++    }
++
++    @Override
++    public IImsRegistration getRegistration(int slotId) {
++        if (mSprdServiceController == null) {
++            return super.getRegistration(slotId);
++        }
++        ImsRegistrationCompatAdapter adapter = mRegCompatAdapters.get(slotId);
++        if (adapter == null) {
++            Log.w(TAG, "getRegistration: Registration does not exist for slot " + slotId);
++            return null;
++        }
++        return adapter.getBinder();
++    }
++
++    @Override
++    public ISipTransport getSipTransport(int slotId) {
++        // Old AIDL doesn't support SIP transport
++        return null;
++    }
++
++    // ============== Old AIDL Protocol Methods ==============
++
++    private IImsMMTelFeature callOldCreateMmTelFeature(int slotId,
++            IImsFeatureStatusCallback callback) throws RemoteException {
++        Parcel data = Parcel.obtain();
++        Parcel reply = Parcel.obtain();
++        try {
++            data.writeInterfaceToken(OLD_DESCRIPTOR);
++            data.writeInt(slotId);
++            data.writeStrongBinder(callback != null ? callback.asBinder() : null);
++            mSprdServiceController.transact(OLD_TRANSACTION_createMmTelFeature, data, reply, 0);
++            reply.readException();
++            IBinder binder = reply.readStrongBinder();
++            return IImsMMTelFeature.Stub.asInterface(binder);
++        } finally {
++            reply.recycle();
++            data.recycle();
++        }
++    }
++
++    private IImsRcsFeature callOldCreateRcsFeature(int slotId,
++            IImsFeatureStatusCallback callback) throws RemoteException {
++        Parcel data = Parcel.obtain();
++        Parcel reply = Parcel.obtain();
++        try {
++            data.writeInterfaceToken(OLD_DESCRIPTOR);
++            data.writeInt(slotId);
++            data.writeStrongBinder(callback != null ? callback.asBinder() : null);
++            mSprdServiceController.transact(OLD_TRANSACTION_createRcsFeature, data, reply, 0);
++            reply.readException();
++            IBinder binder = reply.readStrongBinder();
++            return IImsRcsFeature.Stub.asInterface(binder);
++        } finally {
++            reply.recycle();
++            data.recycle();
++        }
++    }
++
++    private void callOldRemoveImsFeature(int slotId, int featureType,
++            IImsFeatureStatusCallback callback) throws RemoteException {
++        Parcel data = Parcel.obtain();
++        Parcel reply = Parcel.obtain();
++        try {
++            data.writeInterfaceToken(OLD_DESCRIPTOR);
++            data.writeInt(slotId);
++            data.writeInt(featureType);
++            data.writeStrongBinder(callback != null ? callback.asBinder() : null);
++            mSprdServiceController.transact(OLD_TRANSACTION_removeImsFeature, data, reply, 0);
++            reply.readException();
++        } finally {
++            reply.recycle();
++            data.recycle();
++        }
++    }
++
++    private void callOldNotifyImsServiceReady() throws RemoteException {
++        Parcel data = Parcel.obtain();
++        Parcel reply = Parcel.obtain();
++        try {
++            data.writeInterfaceToken(OLD_DESCRIPTOR);
++            mSprdServiceController.transact(
++                    OLD_TRANSACTION_notifyImsServiceReadyForFeatureCreation, data, reply, 0);
++            reply.readException();
++        } finally {
++            reply.recycle();
++            data.recycle();
++        }
++    }
++
++    private IImsConfig callOldGetConfig(int slotId) throws RemoteException {
++        Parcel data = Parcel.obtain();
++        Parcel reply = Parcel.obtain();
++        try {
++            data.writeInterfaceToken(OLD_DESCRIPTOR);
++            data.writeInt(slotId);
++            mSprdServiceController.transact(OLD_TRANSACTION_getConfig, data, reply, 0);
++            reply.readException();
++            IBinder binder = reply.readStrongBinder();
++            // The old protocol returns IImsConfig (from com.android.ims.internal.IImsConfig)
++            // which is the compat/internal version.
++            return android.telephony.ims.aidl.IImsConfig.Stub.asInterface(binder);
++        } finally {
++            reply.recycle();
++            data.recycle();
++        }
++    }
++
++    private IImsRegistration callOldGetRegistration(int slotId) throws RemoteException {
++        Parcel data = Parcel.obtain();
++        Parcel reply = Parcel.obtain();
++        try {
++            data.writeInterfaceToken(OLD_DESCRIPTOR);
++            data.writeInt(slotId);
++            mSprdServiceController.transact(OLD_TRANSACTION_getRegistration, data, reply, 0);
++            reply.readException();
++            IBinder binder = reply.readStrongBinder();
++            return IImsRegistration.Stub.asInterface(binder);
++        } finally {
++            reply.recycle();
++            data.recycle();
++        }
++    }
++
++    private void callOldEnableIms(int slotId) throws RemoteException {
++        Parcel data = Parcel.obtain();
++        Parcel reply = Parcel.obtain();
++        try {
++            data.writeInterfaceToken(OLD_DESCRIPTOR);
++            data.writeInt(slotId);
++            mSprdServiceController.transact(OLD_TRANSACTION_enableIms, data, reply,
++                    android.os.IBinder.FLAG_ONEWAY);
++        } finally {
++            reply.recycle();
++            data.recycle();
++        }
++    }
++
++    private void callOldDisableIms(int slotId) throws RemoteException {
++        Parcel data = Parcel.obtain();
++        Parcel reply = Parcel.obtain();
++        try {
++            data.writeInterfaceToken(OLD_DESCRIPTOR);
++            data.writeInt(slotId);
++            mSprdServiceController.transact(OLD_TRANSACTION_disableIms, data, reply,
++                    android.os.IBinder.FLAG_ONEWAY);
++        } finally {
++            reply.recycle();
++            data.recycle();
++        }
++    }
++
++    // ============== FeatureStatusCallback Management ==============
++
++    private IImsFeatureStatusCallback getOrCreateFeatureStatusCallback(
++            int slotId, int featureType) {
++        synchronized (mFeatureStatusCallbacks) {
++            java.util.Map<Integer, IImsFeatureStatusCallback> slotMap =
++                    mFeatureStatusCallbacks.get(slotId);
++            if (slotMap != null) {
++                IImsFeatureStatusCallback cb = slotMap.get(featureType);
++                if (cb != null) return cb;
++            }
++        }
++        return null;
++    }
++
++    private void storeFeatureStatusCallback(int slotId, int featureType,
++            IImsFeatureStatusCallback c) {
++        synchronized (mFeatureStatusCallbacks) {
++            java.util.Map<Integer, IImsFeatureStatusCallback> slotMap =
++                    mFeatureStatusCallbacks.computeIfAbsent(slotId, k -> new java.util.HashMap<>());
++            slotMap.put(featureType, c);
++        }
++    }
++
++    private void removeFeatureStatusCallback(int slotId, int featureType) {
++        synchronized (mFeatureStatusCallbacks) {
++            java.util.Map<Integer, IImsFeatureStatusCallback> slotMap =
++                    mFeatureStatusCallbacks.get(slotId);
++            if (slotMap != null) {
++                slotMap.remove(featureType);
++            }
++        }
++    }
++}

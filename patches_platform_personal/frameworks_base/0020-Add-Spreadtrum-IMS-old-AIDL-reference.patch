@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: LineageOS Developer <developer@lineageos.org>
+Date: Fri, 29 May 2026 22:00:00 +0800
+Subject: [PATCH] Add Spreadtrum IMS old AIDL protocol reference
+
+Documentation file describing the old Android 9 era IImsServiceController
+AIDL protocol used by the Spreadtrum IMS APK. The actual protocol
+translation is handled in SprdImsServiceControllerCompat.java via raw
+Parcel transactions.
+
+Change-Id: I0000000000000000000000000000000000000001
+---
+ .../ISprdImsServiceController.aidl.txt          | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+ create mode 100644 telephony/java/com/android/ims/internal/ISprdImsServiceController.aidl.txt
+
+diff --git a/telephony/java/com/android/ims/internal/ISprdImsServiceController.aidl.txt b/telephony/java/com/android/ims/internal/ISprdImsServiceController.aidl.txt
+new file mode 100644
+index 000000000000..39e03eea3c45
+--- /dev/null
++++ b/telephony/java/com/android/ims/internal/ISprdImsServiceController.aidl.txt
+@@ -0,0 +1,15 @@
++// Intentionally empty - the old Spreadtrum AIDL protocol is handled via
++// raw Parcel transactions in SprdImsServiceControllerCompat.java.
++// This file exists only to document the old AIDL layout:
++//
++// Old IImsServiceController (Android 9, android.telephony.ims.aidl):
++//   setListener(IBinder)
++//   createMmTelFeature(int, IImsFeatureStatusCallback) -> IImsMMTelFeature
++//   createRcsFeature(int, IImsFeatureStatusCallback) -> IImsRcsFeature
++//   querySupportedImsFeatures() -> ImsFeatureConfiguration
++//   notifyImsServiceReadyForFeatureCreation()
++//   removeImsFeature(int, int, IImsFeatureStatusCallback)
++//   getConfig(int) -> IImsConfig
++//   getRegistration(int) -> IImsRegistration
++//   enableIms(int)
++//   disableIms(int)
